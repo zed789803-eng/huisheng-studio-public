@@ -1,0 +1,10 @@
+# 这个项目只在 macOS 上构建/打包：源码一律按 LF 存和检出，
+# 免得在 Windows 上编辑过的 shell 脚本把 \r 带进安装包。
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.icns binary
+*.dmg binary
+*.pkg binary

@@ -1,0 +1,54 @@
+#!/bin/sh
+set -eu
+
+DRIVER="/Library/Audio/Plug-Ins/HAL/HuishengStudio.driver"
+
+# coreaudiod only loads HAL plug-ins owned by root:wheel. Package payloads are
+# normally installed that way already, but a previous manual `cp` can leave the
+# directory owned by the user, so enforce it.
+if [ -d "$DRIVER" ]; then
+    /usr/sbin/chown -R root:wheel "$DRIVER"
+    /bin/chmod -R go-w "$DRIVER"
+    /usr/bin/xattr -cr "$DRIVER" 2>/dev/null || true
+fi
+
+/bin/launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null \
+    || /usr/bin/killall coreaudiod 2>/dev/null || true
+
+# AudioComponentRegistrar caches the AudioComponents entries it found when it
+# started. Without a restart, a host that is already running (or a Logic launch
+# right after the install) can scan a stale list and report the AU as missing
+# until the machine reboots.
+/usr/bin/killall -9 AudioComponentRegistrar 2>/dev/null || true
+
+# Ask for the two TCC permissions as the logged-in user. Running the agent as
+# root would record the grant against the wrong identity.
+LOG=/var/log/huishengstudio-install.log
+log() { echo "$(/bin/date '+%Y-%m-%d %H:%M:%S') $*" >>"$LOG" 2>/dev/null || true; }
+
+sleep 2
+
+APP="/Applications/HuishengStudio Agent.app"
+CONSOLE_USER="$(/usr/bin/stat -f %Su /dev/console 2>/dev/null || true)"
+
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
+    log "no graphical console user; skipping the permission prompt"
+    exit 0
+fi
+
+CONSOLE_UID="$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null || true)"
+[ -n "$CONSOLE_UID" ] || exit 0
+
+if [ ! -d "$APP" ]; then
+    log "missing $APP"
+    exit 0
+fi
+
+/usr/bin/pkill -f "$APP/Contents/MacOS/HuishengStudio Agent" 2>/dev/null || true
+sleep 1
+
+/bin/launchctl asuser "$CONSOLE_UID" \
+    /usr/bin/open -n -a "$APP" --args --request-permissions \
+    || log "could not launch the agent"
+
+exit 0

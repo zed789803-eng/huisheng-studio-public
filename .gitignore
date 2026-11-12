@@ -1,0 +1,36 @@
+# Build output
+/build/
+/build-release/
+/dist/
+*.dmg
+*.pkg
+*.app/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.o
+*.a
+*.dSYM/
+
+# Vendored toolchains and dependencies (JUCE is fetched by CMake, not tracked)
+/third_party/JUCE
+/third_party/cmake-*
+
+# macOS noise
+.DS_Store
+._*
+*.swp
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+
+# 构建前注入的产品密钥（CI 从 Secret 生成；本机自己生成，都不进仓库）
+/shared/LicenseKey.generated.h
+/tools/keygen/windows/key.local.txt
+
+# Python 编译缓存（曾经误提交过，里面带着旧的密钥常量）
+__pycache__/
+*.pyc

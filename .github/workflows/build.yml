@@ -1,0 +1,438 @@
+name: build
+
+# 出包只需要一台 macOS：GitHub 的 macOS runner 就是那台机器。
+# 公开仓库的 macOS 分钟免费；私有仓库每月有额度，一次完整出包几分钟。
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: 单元测试
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: 环境
+        run: |
+          sw_vers
+          clang++ --version | head -1
+      - name: 编译并运行 tests/run.sh
+        env:
+          HS_PRODUCT_KEY: ${{ secrets.HS_PRODUCT_KEY }}
+        run: sh tests/run.sh
+
+  package:
+    name: 安装包
+    needs: test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: 注入产品密钥（密钥不进仓库，只从仓库 Secret 取）
+        env:
+          HS_PRODUCT_KEY: ${{ secrets.HS_PRODUCT_KEY }}
+        run: |
+          if [ -n "${HS_PRODUCT_KEY:-}" ]; then
+            BYTES="$(printf '%s' "$HS_PRODUCT_KEY" | sed 's/../0x&, /g')"
+            printf '#define HS_LICENSE_KEY_BYTES %s\n' "$BYTES" > shared/LicenseKey.generated.h
+            echo "product key injected: $(wc -c < shared/LicenseKey.generated.h) bytes of header"
+          else
+            echo "::warning::HS_PRODUCT_KEY is not set: this build cannot register codes"
+          fi
+      - name: 准备 cmake
+        run: |
+          command -v cmake || brew install cmake
+          cmake --version
+      - name: 打包（Agent + 插件 + 驱动 + pkg/dmg）
+        # runner 上没有 Developer ID，用 ad-hoc 签名（-）；不覆盖的话
+        # package.sh 会去找仓库里那个本机签名身份，然后失败。
+        env:
+          APP_SIGN_IDENTITY: "-"
+        run: sh scripts/package.sh
+      - name: 注册码生成器（命令行 + 窗口版）
+        run: |
+          cmake --build build-release --target hskeygen HuishengStudioKeygen -j 4
+          ./build-release/hskeygen --selftest
+          APP="$(find "$(pwd)/build-release" -type d -name 'HuishengStudio Keygen.app' | head -1)"
+          echo "keygen app: [$APP]"
+          if [ -z "$APP" ]; then
+            find build-release -type d -name '*.app' | head -20
+            exit 1
+          fi
+          sh cmake/postprocess_keygen.sh "$APP"
+          "$APP/Contents/MacOS/HuishengStudio Keygen" --selftest
+          mkdir -p keygen-shots
+          ( cd keygen-shots && "$APP/Contents/MacOS/HuishengStudio Keygen" --render keygen.png 张三 )
+          ls -l keygen-shots
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/HsAudio-keygen-1.0.12.zip"
+          ls -lh dist
+      - name: 产物清单
+        run: ls -lh dist
+      - name: 插件界面出图
+        # tools/preview 把两个编辑器离屏画成 PNG，不需要 DAW，也不需要显示权限。
+        # 找不到二进制不中断，后面的装机检查还是要跑。
+        run: |
+          mkdir -p preview-shots
+          echo "== build-release 顶层 =="
+          ls build-release | head -30
+          # 必须取绝对路径：下面要 cd 进 preview-shots，相对路径会失效。
+          BIN="$(find "$(pwd)/build-release" -type f -path '*Preview*.app/Contents/MacOS/*' | head -1)"
+          echo "preview binary: [$BIN]"
+          if [ -z "$BIN" ]; then
+            echo "没找到预览程序，列出所有 .app："
+            find build-release -type d -name '*.app' | head -20
+          else
+            cd preview-shots
+            "$BIN" > preview.log 2>&1 & pid=$!
+            sleep 25
+            kill $pid 2>/dev/null || true
+            wait $pid 2>/dev/null || true
+            echo "== preview 输出 =="
+            cat preview.log || true
+            # 两个实例必须各占一路、App 采样率与工程不一致时不能静音：
+            # 这两条是 1.0.12 的验收点，出图程序会把结论打在日志里。
+            grep -q "slot checks: PASSED" preview.log || {
+              echo "::error::多实例/采样率检查没通过（见 preview.log）"
+              exit 1
+            }
+            ls -l
+          fi
+      - name: 展开安装包，核对资源与源码一致
+        run: |
+          rm -rf unpacked
+          pkgutil --expand dist/HsAudio-1.0.12.pkg unpacked
+          echo "== 展开后的目录 =="
+          ls -lR unpacked | head -40
+          echo "== 安装器背景图是否就是源码里那张 =="
+          shasum -a 256 packaging/logo.png unpacked/Resources/logo.png || true
+          cmp packaging/logo.png unpacked/Resources/logo.png && echo "安装器背景图：一致" || echo "安装器背景图：不一致"
+          echo "== 安装界面文案里还有没有占位符 =="
+          grep -c __REPO_SLUG__ unpacked/Resources/*.html unpacked/Distribution || true
+          echo "== 组件包里的文件树 =="
+          rm -rf unpacked-full
+          pkgutil --expand-full dist/HsAudio-1.0.12.pkg unpacked-full
+          find unpacked-full -type f | sed 's|^unpacked-full/||' | sort | head -60
+          echo "== 文件总数 =="
+          find unpacked-full -type f | wc -l
+      - name: 核对签名、标识、dmg 与注册机（对不上就失败）
+        run: |
+          fail=0
+          PAYLOAD="$(find unpacked-full -type d -name Payload | head -1)"
+          echo "payload: $PAYLOAD"
+
+          echo "== 1. 六个 bundle 一个不少 =="
+          count=$(ls -d "$PAYLOAD"/Library/Audio/Plug-Ins/HAL/*.driver \
+                       "$PAYLOAD"/Library/Audio/Plug-Ins/VST3/*.vst3 \
+                       "$PAYLOAD"/Library/Audio/Plug-Ins/Components/*.component \
+                       "$PAYLOAD"/Applications/*.app 2>/dev/null | wc -l | tr -d ' ')
+          echo "bundle 数量: $count"
+          [ "$count" = "6" ] || { echo "bundle 数量不对"; fail=1; }
+
+          echo "== 2. 逐个验签 =="
+          for b in "$PAYLOAD"/Library/Audio/Plug-Ins/HAL/*.driver \
+                   "$PAYLOAD"/Library/Audio/Plug-Ins/VST3/*.vst3 \
+                   "$PAYLOAD"/Library/Audio/Plug-Ins/Components/*.component \
+                   "$PAYLOAD"/Applications/*.app ; do
+            [ -e "$b" ] || continue
+            xattr -cr "$b" 2>/dev/null || true
+            if codesign --verify --deep --strict "$b" 2>/dev/null; then
+              echo "OK   $(basename "$b")"
+            else
+              echo "FAIL $(basename "$b")"
+              codesign --verify --deep --strict --verbose=2 "$b" || true
+              fail=1
+            fi
+          done
+
+          echo "== 3. 标识符 =="
+          for p in "$PAYLOAD"/Library/Audio/Plug-Ins/HAL/*.driver \
+                   "$PAYLOAD"/Library/Audio/Plug-Ins/VST3/*.vst3 \
+                   "$PAYLOAD"/Library/Audio/Plug-Ins/Components/*.component \
+                   "$PAYLOAD"/Applications/*.app ; do
+            [ -e "$p" ] || continue
+            id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$p/Contents/Info.plist" 2>/dev/null || echo '?')"
+            echo "  $(basename "$p") -> $id"
+            case "$id" in
+              com.huishengstudio.*) ;;
+              *) echo "  标识符不是 com.huishengstudio.*"; fail=1 ;;
+            esac
+          done
+
+          echo "== 3b. 宿主里看到的插件名和厂商名 =="
+          # 1.0.12 的验收点：宿主列表里必须是 HsAudio Capture / HsAudio Return，
+          # 厂商那行也必须是 HsAudio。四字码（Huis / Cap1 / Ret1）和 bundle id
+          # 一个都不许变——老工程靠它们认插件。
+          want="HsAudio Capture.vst3 HsAudio Return.vst3"
+          got="$(cd "$PAYLOAD/Library/Audio/Plug-Ins/VST3" && ls -d *.vst3 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+          echo "  VST3: [$got]"
+          [ "$got" = "$want" ] || { echo "  VST3 目录名不是 $want"; fail=1; }
+          want="HsAudio Capture.component HsAudio Return.component"
+          got="$(cd "$PAYLOAD/Library/Audio/Plug-Ins/Components" && ls -d *.component 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+          echo "  AU:   [$got]"
+          [ "$got" = "$want" ] || { echo "  AU 目录名不是 $want"; fail=1; }
+
+          for name in "HsAudio Capture" "HsAudio Return"; do
+            for bundle in "$PAYLOAD/Library/Audio/Plug-Ins/VST3/$name.vst3" \
+                          "$PAYLOAD/Library/Audio/Plug-Ins/Components/$name.component"; do
+              [ -d "$bundle" ] || { echo "  缺 $(basename "$bundle")"; fail=1; continue; }
+              exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$bundle/Contents/Info.plist" 2>/dev/null || true)"
+              bin="$bundle/Contents/MacOS/$exe"
+              strings -a "$bin" 2>/dev/null | grep -n "HsAudio" | head -6 | sed 's/^/    含 HsAudio 的串: /'
+              if strings -a "$bin" 2>/dev/null | grep -qx "$name"; then
+                echo "  OK   二进制里有 \"$name\"  ($(basename "$bundle"))"
+              else
+                echo "  FAIL 二进制里没有 \"$name\"  ($(basename "$bundle"))"; fail=1
+              fi
+              if strings -a "$bin" 2>/dev/null | grep -q -e "HuishengStudio Capture" -e "HuishengStudio Return"; then
+                echo "  FAIL 二进制里还留着老名字 ($(basename "$bundle"))"; fail=1
+              fi
+              if [ "${bundle##*.}" = "vst3" ]; then
+                # VST3 的厂商串是编进二进制里的独立字符串；AU 的厂商名写在
+                # Info.plist 的 AudioComponents:0:name 前缀里（见下面 3c），
+                # 二进制里根本没有这一条，别拿 VST3 的规则去卡 AU。
+                if strings -a "$bin" 2>/dev/null | grep -Eq "^HsAudio *$"; then
+                  echo "  OK   厂商串是 HsAudio ($(basename "$bundle"))"
+                else
+                  echo "  FAIL 厂商串不是 HsAudio ($(basename "$bundle"))"; fail=1
+                fi
+              fi
+            done
+          done
+
+          echo "== 3c. AU 在 Logic 里显示的名字与四字码 =="
+          for name in "HsAudio Capture" "HsAudio Return"; do
+            plist="$PAYLOAD/Library/Audio/Plug-Ins/Components/$name.component/Contents/Info.plist"
+            [ -f "$plist" ] || { echo "  缺 $plist"; fail=1; continue; }
+            auname="$(/usr/libexec/PlistBuddy -c 'Print :AudioComponents:0:name' "$plist" 2>/dev/null || true)"
+            aumaker="$(/usr/libexec/PlistBuddy -c 'Print :AudioComponents:0:manufacturer' "$plist" 2>/dev/null || true)"
+            echo "  $name -> name=[$auname] manufacturer=[$aumaker]"
+            [ "$aumaker" = "Huis" ] || { echo "  AU 四字码变了（应为 Huis）"; fail=1; }
+            case "$auname" in
+              "HsAudio: "*) ;;
+              *) echo "  AU 显示名的厂商前缀不是 HsAudio（应该是 \"HsAudio: 插件名\"）"; fail=1 ;;
+            esac
+          done
+
+          echo "== 3d. 载荷里不许再有这两个插件的老文件名 =="
+          oldfiles="$(find "$PAYLOAD" -maxdepth 6 \( -name 'HuishengStudio Capture.*' -o -name 'HuishengStudio Return.*' \) -print 2>/dev/null || true)"
+          if [ -n "$oldfiles" ]; then
+            echo "$oldfiles"; echo "  旧插件文件名还在载荷里"; fail=1
+          else
+            echo "  干净"
+          fi
+
+          echo "== 4. 载荷里还有没有上游标识（THIRD-PARTY-NOTICES 除外）=="
+          hits="$(grep -rl -e wannengya -e Wannengya -e com.wannengya -e Wngy "$PAYLOAD" 2>/dev/null | grep -v 'THIRD-PARTY-NOTICES' || true)"
+          if [ -n "$hits" ]; then
+            echo "$hits"
+            echo "载荷里有上游标识残留"
+            fail=1
+          else
+            echo "干净"
+          fi
+
+          echo "== 5. 安装界面文案里还有没有占位符 =="
+          if grep -q -e __REPO_SLUG__ -e __VERSION__ unpacked/Resources/*.html unpacked/Distribution 2>/dev/null; then
+            echo "还有占位符没替换"
+            fail=1
+          else
+            echo "没有占位符"
+          fi
+
+          echo "== 6. dmg 里那个包和 dist 里的 pkg 是不是同一个文件 =="
+          hdiutil detach /tmp/hsdmg 2>/dev/null || true
+          rm -rf /tmp/hsdmg && mkdir -p /tmp/hsdmg
+          hdiutil attach dist/HsAudio-1.0.12.dmg -nobrowse -mountpoint /tmp/hsdmg >/dev/null
+          ls -l /tmp/hsdmg
+          shasum -a 256 dist/HsAudio-1.0.12.pkg /tmp/hsdmg/HsAudio-1.0.12.pkg
+          if cmp dist/HsAudio-1.0.12.pkg /tmp/hsdmg/HsAudio-1.0.12.pkg; then
+            echo "dmg 里的包：和 dist 里的一致"
+          else
+            echo "dmg 里的包：不一致"
+            fail=1
+          fi
+          test -f /tmp/hsdmg/LICENSE.txt && echo "dmg 里有 LICENSE.txt" || { echo "dmg 里没有 LICENSE.txt"; fail=1; }
+          hdiutil detach /tmp/hsdmg >/dev/null || true
+
+          echo "== 7. 朋友拿到的那份注册机（zip 解出来）能用吗 =="
+          rm -rf /tmp/kship && mkdir -p /tmp/kship
+          ditto -x -k dist/HsAudio-keygen-1.0.12.zip /tmp/kship
+          KAPP="$(find /tmp/kship -maxdepth 2 -type d -name '*.app' | head -1)"
+          echo "解出来的 app: [$KAPP]"
+          if [ -z "$KAPP" ]; then
+            echo "zip 里没有 .app"; fail=1
+          else
+            xattr -cr "$KAPP" 2>/dev/null || true
+            codesign --verify --deep --strict "$KAPP" && echo "注册机签名 OK" || { echo "注册机验签失败"; fail=1; }
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$KAPP/Contents/Info.plist"
+            test -f "$KAPP/Contents/Resources/AppIcon.icns" && echo "图标在" || { echo "图标不在"; fail=1; }
+            "$KAPP/Contents/MacOS/HuishengStudio Keygen" --selftest && echo "注册机自检 OK" || { echo "注册机自检失败"; fail=1; }
+          fi
+
+          exit $fail
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: HsAudio-1.0.12
+          # 注册机不进公开产物：里面带着发码密钥，公开仓库的 artifact 谁都能下。
+          path: |
+            dist/*
+            !dist/HsAudio-keygen-*.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: keygen-shots
+          path: keygen-shots/keygen.png
+          if-no-files-found: warn
+      - name: 装一遍，看虚拟声卡有没有真的出来
+        # 这一步是"包到底能不能用"的实证：真装、真重启 coreaudiod、真查设备。
+        run: |
+          sudo installer -pkg dist/HsAudio-1.0.12.pkg -target /
+          echo "== HAL =="
+          ls -l /Library/Audio/Plug-Ins/HAL/
+          echo "== VST3 / AU =="
+          ls -l /Library/Audio/Plug-Ins/VST3/ || true
+          ls -l /Library/Audio/Plug-Ins/Components/ || true
+          echo "== /Applications =="
+          ls -ld "/Applications/HuishengStudio Agent.app" || true
+          echo "== 全盘同名的 Agent.app（Installer 可能把可重定位的它装到别处）=="
+          sudo find /Applications "$HOME" /Library /private/tmp -maxdepth 8 \
+              -name "HuishengStudio Agent.app" -print 2>/dev/null || true
+          # 硬门：Agent 必须落在 /Applications。它是插件唯一的后台入口，
+          # 少了它界面就永远停在"后台未运行"，后面的注册出图也全是废证据。
+          test -d "/Applications/HuishengStudio Agent.app" || {
+            echo "::error::/Applications 下没有 HuishengStudio Agent.app —— 安装包没把它装到位"; exit 1; }
+          test -x "/Applications/HuishengStudio Agent.app/Contents/MacOS/HuishengStudio Agent" || {
+            echo "::error::Agent 主程序不在或不可执行"; exit 1; }
+          sudo killall coreaudiod || true
+          sleep 8
+          system_profiler SPAudioDataType > audio-devices.txt || true
+          echo "== AU 注册表里叫什么（Logic 的插件列表就是这两行）=="
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          sleep 2
+          auval -a 2>/dev/null | grep -i -e HsAudio -e Huisheng > au-list.txt || true
+          cat au-list.txt
+          echo "命中 HsAudio 的行数: $(grep -c HsAudio au-list.txt || true)"
+          echo "== 设备名单：4 个只出的 HsAudioSC + 4 个只进的 HsAudioSR =="
+          grep -E "HsAudio(SC|SR) [0-9]/[0-9]" audio-devices.txt || true
+          echo "输出半台 HsAudioSC: $(grep -c -E 'HsAudioSC [0-9]/[0-9]' audio-devices.txt || true)"
+          echo "输入半台 HsAudioSR: $(grep -c -E 'HsAudioSR [0-9]/[0-9]' audio-devices.txt || true)"
+          for name in "HsAudioSC 1/2" "HsAudioSC 3/4" "HsAudioSC 5/6" "HsAudioSC 7/8" \
+                      "HsAudioSR 1/2" "HsAudioSR 3/4" "HsAudioSR 5/6" "HsAudioSR 7/8"; do
+            grep -qF "$name" audio-devices.txt || {
+              echo "::error::系统的设备名单里没有 \"$name\" —— 驱动没把它发布出来"; exit 1; }
+          done
+          if grep -qE "huisheng [0-9]/[0-9]" audio-devices.txt; then
+            echo "::error::系统里还留着旧名字的 huisheng 设备，覆盖安装没清干净"
+            grep -E "huisheng [0-9]/[0-9]" -A5 audio-devices.txt || true
+            exit 1
+          fi
+          echo "设备名单核对通过：8 台单向设备，没有旧名字残留"
+          echo "== 安装日志 =="
+          sudo tail -n 40 /var/log/huishengstudio-install.log || true
+      - name: 装完之后出图：后台跑着，未注册 / 已注册两种样子
+        # 这一步回答的是"拿到手打开是什么样"：驱动已经装了、后台程序已经跑着，
+        # 然后分别在没注册码和有注册码两种状态下把插件界面画成 PNG。
+        run: |
+          mkdir -p preview-shots
+          BIN="$(find "$(pwd)/build-release" -type f -path '*Preview*.app/Contents/MacOS/*' | head -1)"
+          echo "preview binary: [$BIN]"
+          LIC="$HOME/Library/Application Support/huishengstudio/license.txt"
+
+          echo "== 重启后台程序，让它按当前注册状态重新判断 =="
+          pkill -f "HuishengStudio Agent" || true
+          sleep 2
+          "/Applications/HuishengStudio Agent.app/Contents/MacOS/HuishengStudio Agent" --request-permissions > preview-shots/agent.log 2>&1 &
+          sleep 6
+          pgrep -fl "HuishengStudio Agent" || echo "后台程序没有起来"
+
+          echo "== 让回传那条路有个活着的插件 =="
+          # 后台只在"插件心跳变化"时才重判注册状态；离屏渲染里没有插件在打
+          # 心跳，就会把之前发布的"未注册"一直挂着。hsreturnsim 就是干这个的。
+          ./build-release/hsreturnsim 300 0 > preview-shots/returnsim.log 2>&1 &
+          sleep 3
+
+          echo "== 医生检查：设备在不在、跑不跑 =="
+          ./build-release/hsdoctor > preview-shots/doctor.txt 2>&1 || true
+          cat preview-shots/doctor.txt
+          grep -q "All checks passed." preview-shots/doctor.txt || {
+            echo "::error::hsdoctor 没通过：设备不齐或引擎跑不起来"
+            cat preview-shots/doctor.txt; exit 1; }
+
+          shoot() {
+            cd preview-shots
+            "$BIN" > "$1.log" 2>&1 &
+            pid=$!
+            sleep 20
+            kill $pid 2>/dev/null || true
+            wait $pid 2>/dev/null || true
+            mv -f capture.png "$1-capture.png" 2>/dev/null || true
+            mv -f return.png  "$1-return.png"  2>/dev/null || true
+            cd ..
+            echo "-- $1 --"
+            cat "preview-shots/$1.log" || true
+          }
+
+          echo "== 先空跑一次：让后台心跳就位 =="
+          # 第一次渲染时插件还看不到后台的心跳，会画出"后台未运行"。
+          # 先跑一次丢掉，后面两张才是买家打开时的样子。
+          rm -f "$LIC"
+          shoot warmup
+          rm -f preview-shots/warmup-*.png
+
+          echo "== 未注册的样子 =="
+          shoot unregistered
+
+          echo "== 已注册的样子 =="
+          mkdir -p "$(dirname "$LIC")"
+          ./build-release/hskeygen 测试用户 | tail -1 > "$LIC"
+          cat "$LIC"
+          # 后台最多每秒才重读一次注册码，等它跟上再出图。
+          sleep 5
+          shoot registered
+
+          echo "== 桥接状态（后台在线吗、环形缓冲有没有在动）=="
+          ./build-release/hsmon > preview-shots/hsmon.txt 2>&1 || true
+          cat preview-shots/hsmon.txt
+
+          # 硬门：后台必须真的在线、信号真的在跑，界面也必须真的分成两种状态。
+          # 少了这几条，出图可能只是"插件画了个空壳"，上一轮就是这么蒙过去的。
+          grep -Eq "agent[[:space:]]+online" preview-shots/hsmon.txt || {
+            echo "::error::后台不在线（hsmon 没报 agent online），注册链证据无效"
+            cat preview-shots/hsmon.txt
+            exit 1; }
+          if grep -Eq "return[[:space:]]+-1[0-9][0-9]\.[0-9] dB" preview-shots/hsmon.txt; then
+            echo "::error::后台 return 通道还是 -1xx dB，信号没有真的在跑"
+            cat preview-shots/hsmon.txt
+            exit 1
+          fi
+          if grep -q "后台未运行" preview-shots/registered.log; then
+            echo "::error::已注册状态的插件界面仍显示后台未运行"
+            exit 1
+          fi
+          grep -q "运行中" preview-shots/registered.log || {
+            echo "::error::已注册那张图的界面里没有运行中"
+            exit 1; }
+          if grep -q "未注册" preview-shots/registered.log; then
+            echo "::error::已注册那张图的界面里还写着未注册"
+            exit 1
+          fi
+          grep -q "未注册" preview-shots/unregistered.log || {
+            echo "::error::未注册那张图的界面里没有未注册字样"
+            exit 1; }
+
+          ls -l preview-shots
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: preview-shots
+          path: |
+            preview-shots/*.png
+            preview-shots/*.log
+            preview-shots/*.txt
+            audio-devices.txt
+            au-list.txt
+          if-no-files-found: warn

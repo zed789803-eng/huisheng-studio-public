@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>绘声Studio @VERSION@</title>
+    <organization>com.huishengstudio</organization>
+    <domains enable_localSystem="true"/>
+    <options customize="never" require-scripts="true" rootVolumeOnly="true"/>
+    <!-- Below this the process taps the product relies on cannot exist. -->
+    <allowed-os-versions>
+        <os-version min="12.0"/>
+    </allowed-os-versions>
+    <background file="logo.png" alignment="topright" scaling="none"/>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <readme file="readme.html" mime-type="text/html"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.huishengstudio.installer"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="com.huishengstudio.installer" visible="false">
+        <pkg-ref id="com.huishengstudio.installer"/>
+    </choice>
+    <pkg-ref id="com.huishengstudio.installer" version="@VERSION@" onConclusion="none">huishengstudio-component.pkg</pkg-ref>
+</installer-gui-script>

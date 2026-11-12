@@ -1,0 +1,17 @@
+<html><head><meta charset="utf-8"><style>
+body { font-family: -apple-system, "PingFang SC", sans-serif; font-size: 13px; color: #1d1d1f; }
+h2 { font-size: 16px; font-weight: 600; }
+p  { line-height: 1.6; }
+</style></head><body>
+<h2>绘声Studio</h2>
+<p>这个安装包会装上：</p>
+<p>· <b>huishengstudio 虚拟声卡</b>——四个双向设备，1/2、3/4、5/6、7/8<br>
+· <b>HsAudio Capture / Return</b>——两个 VST3 插件（宿主里显示的就是这个名字）<br>
+· <b>后台服务</b>——采集 App 声音、回传混音，没有窗口和 Dock 图标</p>
+<p>安装过程中会要求输入管理员密码，并且在最后弹出系统权限请求。
+两项权限都需要允许，否则插件无法采集指定 App 的声音。</p>
+<p>支持 macOS 12 及以上，安装包同时包含 Apple Silicon 与 Intel 两种架构。</p>
+<p><b>注意</b>：采集单个 App 的声音需要 macOS 14.2 或更高。macOS 12 / 13 上
+只能使用虚拟通道（让 App 输出到 huishengstudio 设备）与 Return 回传。</p>
+<p>安装完成后建议重启一次需要用到插件的宿主（Studio One 等）。</p>
+</body></html>
